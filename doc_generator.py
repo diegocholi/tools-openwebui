@@ -2,10 +2,13 @@ import os
 import csv
 import json
 import mimetypes
+import inspect
 from datetime import datetime
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote
 
 from pydantic import Field
+
 try:
     # pydantic v2
     from pydantic.fields import FieldInfo
@@ -18,26 +21,21 @@ class Tools:
     """
     Open WebUI Tools: gerar e analisar arquivos CSV, PDF, DOCX e PPTX.
 
-    Estratégia MAIS SEGURA para download:
-    - Sempre retornar:
-      - download_path: caminho relativo (ex: /downloads/arquivo.pptx)
-      - download_url: (igual ao download_path) para a UI resolver pela mesma origem
-    - Opcional:
-      - download_url_absolute: se PUBLIC_BASE_URL existir
+    ✅ Atualizado para anexar arquivo via evento do Open WebUI:
+      - Emite "files" e "chat:message:files" (compatibilidade)
+      - Suporta __event_emitter__ síncrono OU assíncrono
+      - Mantém fallback via download_url
 
     Env:
     - TOOLS_OUTPUT_DIR (default: /app/backend/tool_outputs)
-    - PUBLIC_BASE_URL (default: "")           # opcional (apenas para url absoluta extra)
+    - PUBLIC_BASE_URL (default: "")           # opcional (para URL absoluta, se quiser)
     - DOWNLOADS_ROUTE_PATH (default: /downloads)
     """
 
     def __init__(self):
         self.output_dir = os.getenv("TOOLS_OUTPUT_DIR", "/app/backend/tool_outputs")
-
-        # opcional (apenas para gerar um ABSOLUTO como extra)
         self.public_base_url = (os.getenv("PUBLIC_BASE_URL", "") or "").strip().rstrip("/")
 
-        # normaliza rota de downloads (sempre começa com "/" e sem barra no final)
         drp = (os.getenv("DOWNLOADS_ROUTE_PATH", "/downloads") or "").strip()
         if not drp.startswith("/"):
             drp = "/" + drp
@@ -67,7 +65,6 @@ class Tools:
             return default
         if isinstance(v, list):
             return v
-        # se vier como string JSON, tenta parsear
         if isinstance(v, str):
             s = v.strip()
             if (s.startswith("[") and s.endswith("]")) or (s.startswith("{") and s.endswith("}")):
@@ -125,20 +122,83 @@ class Tools:
             "mime_type": mimetypes.guess_type(path)[0] or "application/octet-stream",
         }
 
-    # ✅ MAIS SEGURO: sempre retorna relativo; absoluto é só extra (se PUBLIC_BASE_URL existir)
-    def _download_payload_for(self, path: str) -> Dict[str, str]:
+    def _download_url_for(self, path: str) -> str:
+        """
+        Retorna sempre um caminho relativo /downloads/<arquivo> (com URL-encoding),
+        e se PUBLIC_BASE_URL existir, retorna absoluto.
+        """
         fname = os.path.basename(path)
-        rel = f"{self.downloads_route_path}/{fname}"
+        safe = quote(fname)
+        rel = f"{self.downloads_route_path}/{safe}"
+        return f"{self.public_base_url}{rel}" if self.public_base_url else rel
 
-        payload: Dict[str, str] = {
-            "download_path": rel,  # sempre relativo
-            "download_url": rel,   # sempre relativo (UI resolve pela mesma origem)
-        }
+    async def _emit_any(self, emitter, payload: dict) -> None:
+        """
+        Emite evento suportando emitter async OU sync.
+        """
+        if not emitter:
+            return
 
-        if self.public_base_url:
-            payload["download_url_absolute"] = f"{self.public_base_url}{rel}"
+        # Alguns emitters são async (awaitable), outros sync.
+        try:
+            result = emitter(payload)
+            if inspect.isawaitable(result):
+                await result
+        except Exception:
+            # não quebra a tool
+            return
 
-        return payload
+    async def _emit_notification(self, __event_emitter__, content: str, level: str = "warning") -> None:
+        """
+        Notificação (toast) para debug opcional.
+        """
+        if not __event_emitter__ or not content:
+            return
+        await self._emit_any(
+            __event_emitter__,
+            {
+                "type": "notification",
+                "data": {"type": level, "content": content},
+            },
+        )
+
+    async def _emit_file_attachment(
+        self,
+        __event_emitter__,
+        *,
+        name: str,
+        url: str,
+        debug: bool = False,
+    ) -> Optional[str]:
+        """
+        Emite evento de files para o Open WebUI renderizar como anexo.
+
+        Retorna string de erro (se debug=True), caso falhe.
+        """
+        if not __event_emitter__:
+            return "no_event_emitter"
+        if not name or not url:
+            return "missing_name_or_url"
+
+        file_obj = {"name": name, "url": url}
+
+        # A doc lista 'files' e 'chat:message:files' como tipos válidos.
+        # Emitimos os dois para compatibilidade. :contentReference[oaicite:3]{index=3}
+        try:
+            await self._emit_any(
+                __event_emitter__,
+                {"type": "files", "data": {"files": [file_obj]}},
+            )
+            await self._emit_any(
+                __event_emitter__,
+                {"type": "chat:message:files", "data": {"files": [file_obj]}},
+            )
+            return None
+        except Exception as e:
+            err = f"emit_failed: {e}"
+            if debug:
+                await self._emit_notification(__event_emitter__, f"Falha ao anexar arquivo: {err}", "warning")
+            return err
 
     def _missing_dep(self, dep_name: str, pip_name: Optional[str] = None) -> str:
         pip_name = pip_name or dep_name
@@ -152,13 +212,16 @@ class Tools:
     # -----------------------------
     # CSV
     # -----------------------------
-    def generate_csv(
+    async def generate_csv(
         self,
         filename: str = Field(..., description="Nome do arquivo CSV (ex: dados.csv)"),
         headers: List[str] = Field(..., description="Lista de colunas"),
         rows: List[List[Any]] = Field(default_factory=list, description="Linhas"),
         delimiter: str = Field(";", description="Delimitador do CSV"),
         encoding: str = Field("utf-8", description="Encoding do arquivo"),
+        __event_emitter__=None,
+        __metadata__=None,
+        debug_events: bool = Field(False, description="Se True, inclui info de debug de eventos no retorno"),
     ) -> str:
         try:
             filename = self._norm_str(filename, f"dados_{self._now_stamp()}.csv")
@@ -189,8 +252,17 @@ class Tools:
                 w.writerows(rows)
 
             info = self._file_info(path)
-            info.update(self._download_payload_for(path))
+            download_url = self._download_url_for(path)
+            info["download_url"] = download_url
             info["action"] = "generate_csv"
+
+            err = await self._emit_file_attachment(
+                __event_emitter__, name=info["filename"], url=download_url, debug=debug_events
+            )
+            if debug_events and err:
+                info["event_emit_error"] = err
+                info["function_calling_mode_hint"] = (__metadata__ or {}).get("function_calling", "")
+
             return self._json({"ok": True, **info})
         except Exception as e:
             return self._json({"ok": False, "error": str(e)})
@@ -259,11 +331,14 @@ class Tools:
     # -----------------------------
     # PDF
     # -----------------------------
-    def generate_pdf(
+    async def generate_pdf(
         self,
         filename: str = Field(..., description="Nome do PDF (ex: relatorio.pdf)"),
         title: str = Field("Relatório", description="Título do documento"),
         paragraphs: List[str] = Field(default_factory=list, description="Parágrafos"),
+        __event_emitter__=None,
+        __metadata__=None,
+        debug_events: bool = Field(False, description="Se True, inclui info de debug de eventos no retorno"),
     ) -> str:
         try:
             from reportlab.lib.pagesizes import A4
@@ -282,7 +357,7 @@ class Tools:
             path = self._join_out(safe)
 
             c = canvas.Canvas(path, pagesize=A4)
-            width, height = A4
+            _, height = A4
 
             y = height - 72
             c.setFont("Helvetica-Bold", 16)
@@ -304,8 +379,15 @@ class Tools:
             c.save()
 
             info = self._file_info(path)
-            info.update(self._download_payload_for(path))
+            download_url = self._download_url_for(path)
+            info["download_url"] = download_url
             info["action"] = "generate_pdf"
+
+            err = await self._emit_file_attachment(__event_emitter__, name=info["filename"], url=download_url, debug=debug_events)
+            if debug_events and err:
+                info["event_emit_error"] = err
+                info["function_calling_mode_hint"] = (__metadata__ or {}).get("function_calling", "")
+
             return self._json({"ok": True, **info})
         except Exception as e:
             return self._json({"ok": False, "error": str(e)})
@@ -365,11 +447,14 @@ class Tools:
     # -----------------------------
     # Word (DOCX)
     # -----------------------------
-    def generate_word(
+    async def generate_word(
         self,
         filename: str = Field(..., description="Nome do DOCX (ex: doc.docx)"),
         title: str = Field("Documento", description="Título do documento"),
         paragraphs: List[str] = Field(default_factory=list, description="Parágrafos"),
+        __event_emitter__=None,
+        __metadata__=None,
+        debug_events: bool = Field(False, description="Se True, inclui info de debug de eventos no retorno"),
     ) -> str:
         try:
             from docx import Document
@@ -393,8 +478,15 @@ class Tools:
             doc.save(path)
 
             info = self._file_info(path)
-            info.update(self._download_payload_for(path))
+            download_url = self._download_url_for(path)
+            info["download_url"] = download_url
             info["action"] = "generate_word"
+
+            err = await self._emit_file_attachment(__event_emitter__, name=info["filename"], url=download_url, debug=debug_events)
+            if debug_events and err:
+                info["event_emit_error"] = err
+                info["function_calling_mode_hint"] = (__metadata__ or {}).get("function_calling", "")
+
             return self._json({"ok": True, **info})
         except Exception as e:
             return self._json({"ok": False, "error": str(e)})
@@ -441,7 +533,7 @@ class Tools:
     # -----------------------------
     # PowerPoint (PPTX)
     # -----------------------------
-    def generate_ppt(
+    async def generate_ppt(
         self,
         filename: str = Field(..., description="Nome do PPTX (ex: deck.pptx)"),
         title: str = Field("Apresentação", description="Título da capa"),
@@ -451,6 +543,9 @@ class Tools:
         ),
         subtitle: str = Field("", description="Subtítulo opcional na capa"),
         author: str = Field("", description="Autor opcional na capa"),
+        __event_emitter__=None,
+        __metadata__=None,
+        debug_events: bool = Field(False, description="Se True, inclui info de debug de eventos no retorno"),
     ) -> str:
         try:
             from pptx import Presentation
@@ -516,8 +611,15 @@ class Tools:
             prs.save(path)
 
             info = self._file_info(path)
-            info.update(self._download_payload_for(path))
+            download_url = self._download_url_for(path)
+            info["download_url"] = download_url
             info["action"] = "generate_ppt"
+
+            err = await self._emit_file_attachment(__event_emitter__, name=info["filename"], url=download_url, debug=debug_events)
+            if debug_events and err:
+                info["event_emit_error"] = err
+                info["function_calling_mode_hint"] = (__metadata__ or {}).get("function_calling", "")
+
             return self._json({"ok": True, **info})
         except Exception as e:
             return self._json({"ok": False, "error": str(e)})
@@ -562,9 +664,7 @@ class Tools:
                         if t:
                             texts.append(t)
 
-                extracted.append(
-                    {"slide_index": i, "title": title, "text_blocks": texts[:20]}
-                )
+                extracted.append({"slide_index": i, "title": title, "text_blocks": texts[:20]})
 
             joined: List[str] = []
             for s in extracted:
@@ -603,6 +703,7 @@ class Tools:
             ext = os.path.splitext(path_abs)[1].lower()
 
             if ext == ".csv":
+                # chamada sync de analyze_csv
                 return self.analyze_csv(path_abs)
             if ext == ".pdf":
                 return self.analyze_pdf(path_abs)
